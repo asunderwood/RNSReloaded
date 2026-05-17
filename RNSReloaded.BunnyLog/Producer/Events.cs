@@ -15,7 +15,8 @@ public abstract record BunnyLogEvent(long GameTime) {
 
 public sealed record DamageEvent(
     int PlayerId, string PlayerName, int CharId,
-    int EnemyId, int HbId, int Damage, double PainShare, long GameTime
+    int EnemyId, int HbId, int DataId, string AbilityName,
+    int Damage, double PainShare, long GameTime
 ) : BunnyLogEvent(GameTime) {
     public override string EventName => "Damage";
     public override void WriteDataFields(Utf8JsonWriter w) {
@@ -24,6 +25,8 @@ public sealed record DamageEvent(
         w.WriteNumber("charId", this.CharId);
         w.WriteNumber("enemyId", this.EnemyId);
         w.WriteNumber("hbId", this.HbId);
+        w.WriteNumber("dataId", this.DataId);
+        w.WriteString("abilityName", this.AbilityName);
         w.WriteNumber("damage", this.Damage);
         w.WriteNumber("painShare", this.PainShare);
     }
@@ -31,7 +34,8 @@ public sealed record DamageEvent(
 
 public sealed record DebuffDamageEvent(
     int PlayerId, string PlayerName, int CharId,
-    int EnemyId, int DebuffId, int Damage, double PainShare, long GameTime
+    int EnemyId, int DebuffId, int DataId, string AbilityName,
+    int Damage, double PainShare, long GameTime
 ) : BunnyLogEvent(GameTime) {
     public override string EventName => "DebuffDamage";
     public override void WriteDataFields(Utf8JsonWriter w) {
@@ -40,6 +44,8 @@ public sealed record DebuffDamageEvent(
         w.WriteNumber("charId", this.CharId);
         w.WriteNumber("enemyId", this.EnemyId);
         w.WriteNumber("debuffId", this.DebuffId);
+        w.WriteNumber("dataId", this.DataId);
+        w.WriteString("abilityName", this.AbilityName);
         w.WriteNumber("damage", this.Damage);
         w.WriteNumber("painShare", this.PainShare);
     }

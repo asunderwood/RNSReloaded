@@ -75,6 +75,7 @@ internal unsafe class LogProducer : ILogProducer {
         );
         var playerName = this.LookupPlayerName((int) playerId);
         var charId = this.LookupPlayerCharId((int) playerId);
+        var (dataId, abilityName) = this.LookupAbility(self);
         var gameTime = this.GameTime();
 
         if (hbId != -1) {
@@ -84,6 +85,8 @@ internal unsafe class LogProducer : ILogProducer {
                 CharId: charId,
                 EnemyId: (int) enemyId,
                 HbId: (int) hbId,
+                DataId: dataId,
+                AbilityName: abilityName,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -96,6 +99,8 @@ internal unsafe class LogProducer : ILogProducer {
                 CharId: charId,
                 EnemyId: (int) enemyId,
                 DebuffId: (int) debuffId,
+                DataId: dataId,
+                AbilityName: abilityName,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -126,6 +131,24 @@ internal unsafe class LogProducer : ILogProducer {
             );
         } catch {
             return -1;
+        }
+    }
+
+    // The ability/move instance carries a `dataId` that indexes into the global `itemData`
+    // table. itemData[dataId][0][0] is the move's internal name string (e.g., "mv_defender_2").
+    // FullmoonArsenal/RanXin1Fight.cs:36-38 uses the same access pattern off an analogous
+    // instance, which is what told us this lookup exists at all.
+    private (int dataId, string name) LookupAbility(CInstance* self) {
+        try {
+            var dataIdValue = this.rns.FindValue(self, "dataId");
+            if (dataIdValue == null) return (0, string.Empty);
+            var dataId = (int) this.rns.utils.RValueToLong(dataIdValue);
+            var name = this.rns
+                .FindValue(this.rns.GetGlobalInstance(), "itemData")
+                ->Get(dataId)->Get(0)->Get(0)->ToString() ?? string.Empty;
+            return (dataId, name);
+        } catch {
+            return (0, string.Empty);
         }
     }
 
