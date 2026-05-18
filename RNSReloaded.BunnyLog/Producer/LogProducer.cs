@@ -75,7 +75,7 @@ internal unsafe class LogProducer : ILogProducer {
         );
         var playerName = this.LookupPlayerName((int) playerId);
         var charId = this.LookupPlayerCharId((int) playerId);
-        var (dataId, abilityName) = this.LookupAbility(self);
+        var ability = this.LookupAbility(self);
         var gameTime = this.GameTime();
 
         if (hbId != -1) {
@@ -85,8 +85,9 @@ internal unsafe class LogProducer : ILogProducer {
                 CharId: charId,
                 EnemyId: (int) enemyId,
                 HbId: (int) hbId,
-                DataId: dataId,
-                AbilityName: abilityName,
+                DataId: ability.DataId,
+                AbilityKey: ability.Key,
+                AbilityName: ability.Name,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -99,8 +100,9 @@ internal unsafe class LogProducer : ILogProducer {
                 CharId: charId,
                 EnemyId: (int) enemyId,
                 DebuffId: (int) debuffId,
-                DataId: dataId,
-                AbilityName: abilityName,
+                DataId: ability.DataId,
+                AbilityKey: ability.Key,
+                AbilityName: ability.Name,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -135,21 +137,32 @@ internal unsafe class LogProducer : ILogProducer {
     }
 
     // The ability/move instance carries a `dataId` that indexes into the global `itemData`
-    // table. itemData[dataId][0][0] is the move's internal name string (e.g., "mv_defender_2").
-    // FullmoonArsenal/RanXin1Fight.cs:36-38 uses the same access pattern off an analogous
-    // instance, which is what told us this lookup exists at all.
-    private (int dataId, string name) LookupAbility(CInstance* self) {
+    // table. The probe in commit f174a76 confirmed the per-entry layout:
+    //   itemData[dataId][0][0] -> internal key (e.g., "it_swift_boots", "mv_defender_2")
+    //   itemData[dataId][0][1] -> small integer (tier? rarity?) — skipped for now
+    //   itemData[dataId][0][2] -> display / pretty name (e.g., "Swift Boots")
+    //   itemData[dataId][0][3] -> description text — skipped for now
+    //   itemData[dataId][1][0] -> duplicate of the internal key
+    // Reading [0][0] and [0][2] surfaces both the stable identifier and the friendly name.
+    // Each lookup is wrapped independently because at least one ability in testing had an
+    // empty pretty-name slot; we don't want that to also blank out the key.
+    private (int DataId, string Key, string Name) LookupAbility(CInstance* self) {
+        int dataId = 0;
+        string key = string.Empty;
+        string name = string.Empty;
         try {
             var dataIdValue = this.rns.FindValue(self, "dataId");
-            if (dataIdValue == null) return (0, string.Empty);
-            var dataId = (int) this.rns.utils.RValueToLong(dataIdValue);
-            var name = this.rns
+            if (dataIdValue == null) return (0, key, name);
+            dataId = (int) this.rns.utils.RValueToLong(dataIdValue);
+
+            var sub0 = this.rns
                 .FindValue(this.rns.GetGlobalInstance(), "itemData")
-                ->Get(dataId)->Get(0)->Get(0)->ToString() ?? string.Empty;
-            return (dataId, name);
-        } catch {
-            return (0, string.Empty);
-        }
+                ->Get(dataId)->Get(0);
+
+            try { key  = sub0->Get(0)->ToString() ?? string.Empty; } catch { }
+            try { name = sub0->Get(2)->ToString() ?? string.Empty; } catch { }
+        } catch { }
+        return (dataId, key, name);
     }
 
     private RValue* NewFightDetour(
