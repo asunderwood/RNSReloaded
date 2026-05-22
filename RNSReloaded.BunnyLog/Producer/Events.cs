@@ -13,9 +13,23 @@ public abstract record BunnyLogEvent(long GameTime) {
     public abstract void WriteDataFields(Utf8JsonWriter writer);
 }
 
+/// <summary>
+/// Temporary container for the shotgun-probe round on multi-player / item name resolution.
+/// Each field corresponds to a candidate value the mod scrapes alongside the known good answer
+/// so we can identify the right source by observing values over many events. Removed once we
+/// know which source consistently has what we want.
+/// </summary>
+public sealed record AbilityProbe(
+    int SelfId, int ActionScript,
+    string Idx0_1, string Idx0_3, string Idx0_4,
+    string Idx1_1, string Idx2_0, string Idx2_1,
+    string AltHbData, string AltTestItem
+);
+
 public sealed record DamageEvent(
     int PlayerId, string PlayerName, int CharId,
     int EnemyId, int HbId, int DataId, string AbilityKey, string AbilityName,
+    AbilityProbe Probe,
     int Damage, double PainShare, long GameTime
 ) : BunnyLogEvent(GameTime) {
     public override string EventName => "Damage";
@@ -28,14 +42,29 @@ public sealed record DamageEvent(
         w.WriteNumber("dataId", this.DataId);
         w.WriteString("abilityKey", this.AbilityKey);
         w.WriteString("abilityName", this.AbilityName);
+        WriteProbeFields(w, this.Probe);
         w.WriteNumber("damage", this.Damage);
         w.WriteNumber("painShare", this.PainShare);
+    }
+
+    internal static void WriteProbeFields(Utf8JsonWriter w, AbilityProbe p) {
+        w.WriteNumber("probeSelfId", p.SelfId);
+        w.WriteNumber("probeActionScript", p.ActionScript);
+        w.WriteString("probeIdx0_1", p.Idx0_1);
+        w.WriteString("probeIdx0_3", p.Idx0_3);
+        w.WriteString("probeIdx0_4", p.Idx0_4);
+        w.WriteString("probeIdx1_1", p.Idx1_1);
+        w.WriteString("probeIdx2_0", p.Idx2_0);
+        w.WriteString("probeIdx2_1", p.Idx2_1);
+        w.WriteString("probeAltHbData", p.AltHbData);
+        w.WriteString("probeAltTestItem", p.AltTestItem);
     }
 }
 
 public sealed record DebuffDamageEvent(
     int PlayerId, string PlayerName, int CharId,
     int EnemyId, int DebuffId, int DataId, string AbilityKey, string AbilityName,
+    AbilityProbe Probe,
     int Damage, double PainShare, long GameTime
 ) : BunnyLogEvent(GameTime) {
     public override string EventName => "DebuffDamage";
@@ -48,6 +77,7 @@ public sealed record DebuffDamageEvent(
         w.WriteNumber("dataId", this.DataId);
         w.WriteString("abilityKey", this.AbilityKey);
         w.WriteString("abilityName", this.AbilityName);
+        DamageEvent.WriteProbeFields(w, this.Probe);
         w.WriteNumber("damage", this.Damage);
         w.WriteNumber("painShare", this.PainShare);
     }

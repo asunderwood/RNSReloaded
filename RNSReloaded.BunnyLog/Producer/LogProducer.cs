@@ -76,6 +76,7 @@ internal unsafe class LogProducer : ILogProducer {
         var playerName = this.LookupPlayerName((int) playerId);
         var charId = this.LookupPlayerCharId((int) playerId);
         var ability = this.LookupAbility(self);
+        var probe = this.ProbeAbility(self, ability.DataId);
         var gameTime = this.GameTime();
 
         if (hbId != -1) {
@@ -88,6 +89,7 @@ internal unsafe class LogProducer : ILogProducer {
                 DataId: ability.DataId,
                 AbilityKey: ability.Key,
                 AbilityName: ability.Name,
+                Probe: probe,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -103,6 +105,7 @@ internal unsafe class LogProducer : ILogProducer {
                 DataId: ability.DataId,
                 AbilityKey: ability.Key,
                 AbilityName: ability.Name,
+                Probe: probe,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -134,6 +137,60 @@ internal unsafe class LogProducer : ILogProducer {
         } catch {
             return -1;
         }
+    }
+
+    // Shotgun probe for the multiplayer / outlier-items investigation. Each field is wrapped in
+    // its own try/catch so a bad index doesn't blank the others. Once we identify which probes
+    // consistently carry the right answer for the broken cases, this method goes away and the
+    // winning lookups get folded into LookupAbility above. See feedback_shotgun_debug memory.
+    private AbilityProbe ProbeAbility(CInstance* self, int dataId) {
+        int selfId = 0;
+        int actionScript = 0;
+        string idx0_1 = string.Empty, idx0_3 = string.Empty, idx0_4 = string.Empty;
+        string idx1_1 = string.Empty, idx2_0 = string.Empty, idx2_1 = string.Empty;
+        string altHbData = string.Empty, altTestItem = string.Empty;
+
+        try {
+            var v = this.rns.FindValue(self, "id");
+            if (v != null) selfId = (int) this.rns.utils.RValueToLong(v);
+        } catch { }
+        try {
+            var v = this.rns.FindValue(self, "actionScript");
+            if (v != null) actionScript = (int) this.rns.utils.RValueToLong(v) - 100000;
+        } catch { }
+
+        if (dataId > 0) {
+            try {
+                var item = this.rns
+                    .FindValue(this.rns.GetGlobalInstance(), "itemData")
+                    ->Get(dataId);
+                var sub0 = item->Get(0);
+                try { idx0_1 = sub0->Get(1)->ToString() ?? string.Empty; } catch { }
+                try { idx0_3 = sub0->Get(3)->ToString() ?? string.Empty; } catch { }
+                try { idx0_4 = sub0->Get(4)->ToString() ?? string.Empty; } catch { }
+                try { idx1_1 = item->Get(1)->Get(1)->ToString() ?? string.Empty; } catch { }
+                try { idx2_0 = item->Get(2)->Get(0)->ToString() ?? string.Empty; } catch { }
+                try { idx2_1 = item->Get(2)->Get(1)->ToString() ?? string.Empty; } catch { }
+            } catch { }
+
+            try {
+                altHbData = this.rns
+                    .FindValue(this.rns.GetGlobalInstance(), "hbData")
+                    ->Get(dataId)->Get(0)->ToString() ?? string.Empty;
+            } catch { }
+            try {
+                altTestItem = this.rns
+                    .FindValue(this.rns.GetGlobalInstance(), "testItem")
+                    ->Get(dataId)->Get(0)->ToString() ?? string.Empty;
+            } catch { }
+        }
+
+        return new AbilityProbe(
+            SelfId: selfId, ActionScript: actionScript,
+            Idx0_1: idx0_1, Idx0_3: idx0_3, Idx0_4: idx0_4,
+            Idx1_1: idx1_1, Idx2_0: idx2_0, Idx2_1: idx2_1,
+            AltHbData: altHbData, AltTestItem: altTestItem
+        );
     }
 
     // The ability/move instance carries a `dataId` that indexes into the global `itemData`
