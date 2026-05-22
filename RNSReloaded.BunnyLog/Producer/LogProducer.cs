@@ -25,6 +25,11 @@ internal unsafe class LogProducer : ILogProducer {
     private IHook<ScriptDelegate> triggerCallHook = null!;
     private IHook<ScriptDelegate> gameOverHook = null!;
     private IHook<ScriptDelegate> finishedFightHook = null!;
+    // Debug-branch survey hooks. Their events ship raw argv + a few self field reads without
+    // interpretation — meaning gets applied later by reviewing the log-mirror file.
+    private IHook<ScriptDelegate> playerInvulnHook = null!;
+    private IHook<ScriptDelegate> playerHitHook = null!;
+    private IHook<ScriptDelegate> rewardHook = null!;
 
     public LogProducer(IRNSReloaded rns, IReloadedHooks hooks, ILoggerV1 logger) {
         this.rns = rns;
@@ -38,6 +43,9 @@ internal unsafe class LogProducer : ILogProducer {
         this.triggerCallHook = this.HookScript(hooks, "scr_trigger_call", this.TriggerCallDetour);
         this.gameOverHook = this.HookScript(hooks, "scr_gamecontrol_do_gameover", this.GameOverDetour);
         this.finishedFightHook = this.HookScript(hooks, "scr_battlecontroller_end_round", this.FinishedFightDetour);
+        this.playerInvulnHook = this.HookScript(hooks, "scr_player_invuln", this.PlayerInvulnDetour);
+        this.playerHitHook = this.HookScript(hooks, "scr_pattern_deal_damage_ally", this.PlayerHitDetour);
+        this.rewardHook = this.HookScript(hooks, "scr_rankbar_give_rewards", this.RewardDetour);
     }
 
     public void Subscribe(Action<BunnyLogEvent> consumer) {
@@ -225,8 +233,26 @@ internal unsafe class LogProducer : ILogProducer {
     private RValue* NewFightDetour(
         CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
     ) {
-        this.Emit(new NewFightEvent(this.GameTime()));
+        this.Emit(new NewFightEvent(this.ProbeNewFight(self, argc, argv), this.GameTime()));
         return this.newFightHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private NewFightProbe ProbeNewFight(CInstance* self, int argc, RValue** argv) {
+        return new NewFightProbe(
+            SelfId: ReadSelfInt(this.rns, self, "id"),
+            DataId: ReadSelfInt(this.rns, self, "dataId"),
+            ActionScript: ReadSelfInt(this.rns, self, "actionScript") is var s && s != 0 ? s - 100000 : 0,
+            SelfBpName: ReadSelfString(this.rns, self, "bpName"),
+            SelfScript: ReadSelfString(this.rns, self, "script"),
+            SelfPattern: ReadSelfString(this.rns, self, "pattern"),
+            SelfEncKey: ReadSelfString(this.rns, self, "encKey"),
+            SelfBp: ReadSelfString(this.rns, self, "bp"),
+            SelfPatternScript: ReadSelfString(this.rns, self, "patternScript"),
+            Argc: argc,
+            Argv0: ReadArgvString(argc, argv, 0),
+            Argv1: ReadArgvString(argc, argv, 1),
+            Argv2: ReadArgvString(argc, argv, 2)
+        );
     }
 
     private RValue* AddEnemyDetour(
@@ -253,15 +279,51 @@ internal unsafe class LogProducer : ILogProducer {
             this.rns.FindValue(self, "notches")->Get((int) currentPos)->Get(0)
         );
 
-        this.Emit(new HallwayMoveEvent((int) currentPos, notchType, this.GameTime()));
+        var probe = this.ProbeHallwayMove(self, (int) currentPos);
+        this.Emit(new HallwayMoveEvent((int) currentPos, notchType, probe, this.GameTime()));
         return this.hallwayMoveHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private HallwayMoveProbe ProbeHallwayMove(CInstance* self, int currentPos) {
+        string hallKeyAtPos = string.Empty;
+        string notch1 = string.Empty, notch2 = string.Empty, notch3 = string.Empty;
+        try { hallKeyAtPos = this.rns.FindValue(self, "hallkey")->Get(currentPos)->ToString() ?? ""; } catch { }
+        try { notch1 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(1)->ToString() ?? ""; } catch { }
+        try { notch2 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(2)->ToString() ?? ""; } catch { }
+        try { notch3 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(3)->ToString() ?? ""; } catch { }
+
+        return new HallwayMoveProbe(
+            SelfId: ReadSelfInt(this.rns, self, "id"),
+            HallKeyAtPos: hallKeyAtPos,
+            GlobalCurrentHall: ReadGlobalString(this.rns, "currentHallway"),
+            GlobalCurrentStage: ReadGlobalString(this.rns, "currentStage"),
+            GlobalStageId: ReadGlobalString(this.rns, "stageId"),
+            Notch_1: notch1,
+            Notch_2: notch2,
+            Notch_3: notch3
+        );
     }
 
     private RValue* ChooseHallsDetour(
         CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
     ) {
-        this.Emit(new ChooseHallsEvent(this.GameTime()));
+        var probe = this.ProbeChooseHalls(self);
+        this.Emit(new ChooseHallsEvent(probe, this.GameTime()));
         return this.chooseHallsHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private ChooseHallsProbe ProbeChooseHalls(CInstance* self) {
+        string h0 = string.Empty, h1 = string.Empty, h2 = string.Empty;
+        try { h0 = this.rns.FindValue(self, "hallkey")->Get(0)->ToString() ?? ""; } catch { }
+        try { h1 = this.rns.FindValue(self, "hallkey")->Get(1)->ToString() ?? ""; } catch { }
+        try { h2 = this.rns.FindValue(self, "hallkey")->Get(2)->ToString() ?? ""; } catch { }
+
+        return new ChooseHallsProbe(
+            SelfId: ReadSelfInt(this.rns, self, "id"),
+            HallKey0: h0, HallKey1: h1, HallKey2: h2,
+            GlobalCurrentHall: ReadGlobalString(this.rns, "currentHallway"),
+            GlobalCurrentStage: ReadGlobalString(this.rns, "currentStage")
+        );
     }
 
     private RValue* GameOverDetour(
@@ -322,5 +384,103 @@ internal unsafe class LogProducer : ILogProducer {
         }
 
         return this.triggerCallHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    // === New debug-branch survey hooks ===========================================================
+    // These do NOT interpret the data they see. Each event ships raw argv + a small fixed set of
+    // self field reads; the relay's log-mirror captures everything so patterns can be identified
+    // by reviewing the file across sessions. Move winning fields into typed events later.
+
+    private RValue* PlayerInvulnDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        this.Emit(new PlayerInvulnEvent(this.GameTime()) {
+            PlayerId = ReadSelfInt(this.rns, self, "playerId"),
+            SelfId = ReadSelfInt(this.rns, self, "id"),
+            Argc = argc,
+            Argv0 = ReadArgvString(argc, argv, 0),
+            Argv1 = ReadArgvString(argc, argv, 1),
+            Argv2 = ReadArgvString(argc, argv, 2),
+            Argv3 = ReadArgvString(argc, argv, 3),
+            SelfHp = ReadSelfString(this.rns, self, "hp"),
+            SelfMaxHp = ReadSelfString(this.rns, self, "maxHp"),
+            SelfInvuln = ReadSelfString(this.rns, self, "invuln"),
+        });
+        return this.playerInvulnHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private RValue* PlayerHitDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        this.Emit(new PlayerHitEvent(this.GameTime()) {
+            PlayerId = ReadSelfInt(this.rns, self, "playerId"),
+            SelfId = ReadSelfInt(this.rns, self, "id"),
+            Argc = argc,
+            Argv0 = ReadArgvString(argc, argv, 0),
+            Argv1 = ReadArgvString(argc, argv, 1),
+            Argv2 = ReadArgvString(argc, argv, 2),
+            Argv3 = ReadArgvString(argc, argv, 3),
+            SelfHp = ReadSelfString(this.rns, self, "hp"),
+            SelfMaxHp = ReadSelfString(this.rns, self, "maxHp"),
+        });
+        return this.playerHitHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private RValue* RewardDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        this.Emit(new RewardEvent(this.GameTime()) {
+            SelfId = ReadSelfInt(this.rns, self, "id"),
+            Argc = argc,
+            Argv0 = ReadArgvString(argc, argv, 0),
+            Argv1 = ReadArgvString(argc, argv, 1),
+            Argv2 = ReadArgvString(argc, argv, 2),
+            Argv3 = ReadArgvString(argc, argv, 3),
+            Argv4 = ReadArgvString(argc, argv, 4),
+        });
+        return this.rewardHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    // === Small read helpers shared by the survey probes ==========================================
+    // All three swallow exceptions and return empty / 0 on any failure path so the survey doesn't
+    // crash the detour. The cost is per-probe overhead; acceptable while these are temporary.
+
+    private static int ReadSelfInt(IRNSReloaded rns, CInstance* self, string field) {
+        try {
+            var v = rns.FindValue(self, field);
+            if (v == null) return 0;
+            return (int) rns.utils.RValueToLong(v);
+        } catch {
+            return 0;
+        }
+    }
+
+    private static string ReadSelfString(IRNSReloaded rns, CInstance* self, string field) {
+        try {
+            var v = rns.FindValue(self, field);
+            if (v == null) return string.Empty;
+            return v->ToString() ?? string.Empty;
+        } catch {
+            return string.Empty;
+        }
+    }
+
+    private static string ReadGlobalString(IRNSReloaded rns, string name) {
+        try {
+            var v = rns.FindValue(rns.GetGlobalInstance(), name);
+            if (v == null) return string.Empty;
+            return v->ToString() ?? string.Empty;
+        } catch {
+            return string.Empty;
+        }
+    }
+
+    private static string ReadArgvString(int argc, RValue** argv, int idx) {
+        if (idx >= argc) return string.Empty;
+        try {
+            return argv[idx]->ToString() ?? string.Empty;
+        } catch {
+            return string.Empty;
+        }
     }
 }

@@ -91,22 +91,88 @@ public sealed record NewEnemyEvent(string EnemyKey, int EnemyId, long GameTime) 
     }
 }
 
-public sealed record NewFightEvent(long GameTime) : BunnyLogEvent(GameTime) {
+/// <summary>
+/// Probe attached to NewFightEvent during the variant-investigation round. Each field is a
+/// candidate source for the bp variant identifier (Rem0 vs Rem1 vs Rem2 etc.). Empty strings
+/// mean the lookup didn't resolve.
+/// </summary>
+public sealed record NewFightProbe(
+    int SelfId, int DataId, int ActionScript,
+    string SelfBpName, string SelfScript, string SelfPattern,
+    string SelfEncKey, string SelfBp, string SelfPatternScript,
+    int Argc, string Argv0, string Argv1, string Argv2
+);
+
+public sealed record NewFightEvent(NewFightProbe Probe, long GameTime) : BunnyLogEvent(GameTime) {
     public override string EventName => "NewFight";
-    public override void WriteDataFields(Utf8JsonWriter w) { /* no payload fields yet */ }
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        var p = this.Probe;
+        w.WriteNumber("probeSelfId", p.SelfId);
+        w.WriteNumber("probeDataId", p.DataId);
+        w.WriteNumber("probeActionScript", p.ActionScript);
+        w.WriteString("probeSelfBpName", p.SelfBpName);
+        w.WriteString("probeSelfScript", p.SelfScript);
+        w.WriteString("probeSelfPattern", p.SelfPattern);
+        w.WriteString("probeSelfEncKey", p.SelfEncKey);
+        w.WriteString("probeSelfBp", p.SelfBp);
+        w.WriteString("probeSelfPatternScript", p.SelfPatternScript);
+        w.WriteNumber("probeArgc", p.Argc);
+        w.WriteString("probeArgv0", p.Argv0);
+        w.WriteString("probeArgv1", p.Argv1);
+        w.WriteString("probeArgv2", p.Argv2);
+    }
 }
 
-public sealed record HallwayMoveEvent(int NotchPos, NotchType NotchType, long GameTime) : BunnyLogEvent(GameTime) {
+/// <summary>
+/// Probe attached to HallwayMoveEvent during the stage-identifier investigation. Goal: find
+/// which field tells us the stage (geode/keep/lakeside/lighthouse/nest/outskirts/pinnacle/
+/// streets/toybox/arsenal) and whether more notch-record fields beyond [0] (the type) are useful.
+/// </summary>
+public sealed record HallwayMoveProbe(
+    int SelfId,
+    string HallKeyAtPos, string GlobalCurrentHall, string GlobalCurrentStage, string GlobalStageId,
+    string Notch_1, string Notch_2, string Notch_3
+);
+
+public sealed record HallwayMoveEvent(int NotchPos, NotchType NotchType, HallwayMoveProbe Probe, long GameTime)
+    : BunnyLogEvent(GameTime) {
     public override string EventName => "HallwayMove";
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteNumber("notchPos", this.NotchPos);
         w.WriteString("type", this.NotchType.ToString());
+        var p = this.Probe;
+        w.WriteNumber("probeSelfId", p.SelfId);
+        w.WriteString("probeHallKeyAtPos", p.HallKeyAtPos);
+        w.WriteString("probeGlobalCurrentHall", p.GlobalCurrentHall);
+        w.WriteString("probeGlobalCurrentStage", p.GlobalCurrentStage);
+        w.WriteString("probeGlobalStageId", p.GlobalStageId);
+        w.WriteString("probeNotch_1", p.Notch_1);
+        w.WriteString("probeNotch_2", p.Notch_2);
+        w.WriteString("probeNotch_3", p.Notch_3);
     }
 }
 
-public sealed record ChooseHallsEvent(long GameTime) : BunnyLogEvent(GameTime) {
+/// <summary>
+/// Probe attached to ChooseHallsEvent — the hall-key array is set during scr_hallwayprogress_choose_halls
+/// so this is a natural place to capture the three chosen halls for the upcoming stage.
+/// </summary>
+public sealed record ChooseHallsProbe(
+    int SelfId,
+    string HallKey0, string HallKey1, string HallKey2,
+    string GlobalCurrentHall, string GlobalCurrentStage
+);
+
+public sealed record ChooseHallsEvent(ChooseHallsProbe Probe, long GameTime) : BunnyLogEvent(GameTime) {
     public override string EventName => "ChooseHalls";
-    public override void WriteDataFields(Utf8JsonWriter w) { /* no payload fields yet */ }
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        var p = this.Probe;
+        w.WriteNumber("probeSelfId", p.SelfId);
+        w.WriteString("probeHallKey0", p.HallKey0);
+        w.WriteString("probeHallKey1", p.HallKey1);
+        w.WriteString("probeHallKey2", p.HallKey2);
+        w.WriteString("probeGlobalCurrentHall", p.GlobalCurrentHall);
+        w.WriteString("probeGlobalCurrentStage", p.GlobalCurrentStage);
+    }
 }
 
 public sealed record AddBuffEvent(
@@ -140,5 +206,85 @@ public sealed record EndFightEvent(bool Victory, long GameTime) : BunnyLogEvent(
     public override string EventName => "EndFight";
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteBoolean("victory", this.Victory);
+    }
+}
+
+/// <summary>
+/// Raw survey of scr_player_invuln invocations. Invuln in this game is a common state caused by
+/// many things (revive iframes, item effects, ability iframes); the goal here is to observe
+/// values and decide later which patterns map to which game events.
+/// </summary>
+public sealed record PlayerInvulnEvent(long GameTime) : BunnyLogEvent(GameTime) {
+    public override string EventName => "PlayerInvuln";
+    public int PlayerId { get; init; }
+    public int SelfId { get; init; }
+    public int Argc { get; init; }
+    public string Argv0 { get; init; } = "";
+    public string Argv1 { get; init; } = "";
+    public string Argv2 { get; init; } = "";
+    public string Argv3 { get; init; } = "";
+    public string SelfHp { get; init; } = "";
+    public string SelfMaxHp { get; init; } = "";
+    public string SelfInvuln { get; init; } = "";
+
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("playerId", this.PlayerId);
+        w.WriteNumber("selfId", this.SelfId);
+        w.WriteNumber("argc", this.Argc);
+        w.WriteString("argv0", this.Argv0);
+        w.WriteString("argv1", this.Argv1);
+        w.WriteString("argv2", this.Argv2);
+        w.WriteString("argv3", this.Argv3);
+        w.WriteString("selfHp", this.SelfHp);
+        w.WriteString("selfMaxHp", this.SelfMaxHp);
+        w.WriteString("selfInvuln", this.SelfInvuln);
+    }
+}
+
+/// <summary>Raw survey of scr_pattern_deal_damage_ally — damage targeting a player.</summary>
+public sealed record PlayerHitEvent(long GameTime) : BunnyLogEvent(GameTime) {
+    public override string EventName => "PlayerHit";
+    public int PlayerId { get; init; }
+    public int SelfId { get; init; }
+    public int Argc { get; init; }
+    public string Argv0 { get; init; } = "";
+    public string Argv1 { get; init; } = "";
+    public string Argv2 { get; init; } = "";
+    public string Argv3 { get; init; } = "";
+    public string SelfHp { get; init; } = "";
+    public string SelfMaxHp { get; init; } = "";
+
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("playerId", this.PlayerId);
+        w.WriteNumber("selfId", this.SelfId);
+        w.WriteNumber("argc", this.Argc);
+        w.WriteString("argv0", this.Argv0);
+        w.WriteString("argv1", this.Argv1);
+        w.WriteString("argv2", this.Argv2);
+        w.WriteString("argv3", this.Argv3);
+        w.WriteString("selfHp", this.SelfHp);
+        w.WriteString("selfMaxHp", this.SelfMaxHp);
+    }
+}
+
+/// <summary>Raw survey of scr_rankbar_give_rewards — observe when this fires and with what.</summary>
+public sealed record RewardEvent(long GameTime) : BunnyLogEvent(GameTime) {
+    public override string EventName => "Reward";
+    public int SelfId { get; init; }
+    public int Argc { get; init; }
+    public string Argv0 { get; init; } = "";
+    public string Argv1 { get; init; } = "";
+    public string Argv2 { get; init; } = "";
+    public string Argv3 { get; init; } = "";
+    public string Argv4 { get; init; } = "";
+
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("selfId", this.SelfId);
+        w.WriteNumber("argc", this.Argc);
+        w.WriteString("argv0", this.Argv0);
+        w.WriteString("argv1", this.Argv1);
+        w.WriteString("argv2", this.Argv2);
+        w.WriteString("argv3", this.Argv3);
+        w.WriteString("argv4", this.Argv4);
     }
 }
