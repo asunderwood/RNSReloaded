@@ -67,8 +67,8 @@ public sealed record DamageEvent(
 
 public sealed record DebuffDamageEvent(
     int PlayerId, string PlayerName, int CharId,
-    int EnemyId, int DebuffId, string DebuffName,
-    string HbsInfo1, string HbsInfo2, string HbsInfo3,
+    int EnemyId, int DebuffId,
+    string DebuffKey, string DebuffName,
     int Damage, double PainShare, long GameTime
 ) : BunnyLogEvent(GameTime) {
     public override string EventName => "DebuffDamage";
@@ -78,12 +78,13 @@ public sealed record DebuffDamageEvent(
         w.WriteNumber("charId", this.CharId);
         w.WriteNumber("enemyId", this.EnemyId);
         w.WriteNumber("debuffId", this.DebuffId);
+        // hbsInfo layout confirmed by the [1..3] probe:
+        //   [0] = variant-specific internal key (e.g. "hbs_poison_0"), shipped as debuffKey.
+        //   [1] = base internal key (e.g. "hbs_poison"), unused.
+        //   [2] = pretty display name (e.g. "Poison"), shipped as debuffName.
+        //   [3] = description text, unused on the wire.
+        w.WriteString("debuffKey", this.DebuffKey);
         w.WriteString("debuffName", this.DebuffName);
-        // Round-4.5: hbsInfo[statusId][0] is the internal key (e.g. "hbs_poison_0"). Probing
-        // siblings to find which holds the display / pretty name. Promote next round.
-        w.WriteString("probeHbsInfo1", this.HbsInfo1);
-        w.WriteString("probeHbsInfo2", this.HbsInfo2);
-        w.WriteString("probeHbsInfo3", this.HbsInfo3);
         w.WriteNumber("damage", this.Damage);
         w.WriteNumber("painShare", this.PainShare);
     }
@@ -101,6 +102,20 @@ public sealed record NewFightEvent(string EncounterKey, long GameTime) : BunnyLo
     public override string EventName => "NewFight";
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteString("encounterKey", this.EncounterKey);
+    }
+}
+
+/// <summary>
+/// Fired from `scr_stage_change`. argv[0] = the new stage's location ID, argv[1] = transition
+/// animation duration in ms (or 0 / "undefined" for the very first stage). Discovery cross-ref:
+/// ID 9 = geode, 10 = sanct, 11 = depths, 12 = aurum (per the user's location table — full names
+/// live in `tui/names.rs::location_name` on the relay side).
+/// </summary>
+public sealed record StageChangeEvent(int LocationId, int TransitionMs, long GameTime) : BunnyLogEvent(GameTime) {
+    public override string EventName => "StageChange";
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("locationId", this.LocationId);
+        w.WriteNumber("transitionMs", this.TransitionMs);
     }
 }
 
@@ -222,9 +237,9 @@ public sealed record ChooseHallsEvent(ChooseHallsProbe Probe, long GameTime) : B
 }
 
 public sealed record AddBuffEvent(
-    int UniqueId, int BuffId, string BuffName,
-    string HbsInfo1, string HbsInfo2, string HbsInfo3,
-    int SourceId, int TargetId, bool TargetsEnemy,
+    int UniqueId, int BuffId,
+    string BuffKey, string BuffName,
+    int SourceId, int TargetId, bool TargetsEnemy, int SourceTeamId,
     int Duration, int Strength, int SourceHbId,
     long GameTime
 ) : BunnyLogEvent(GameTime) {
@@ -232,14 +247,15 @@ public sealed record AddBuffEvent(
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteNumber("uniqueId", this.UniqueId);
         w.WriteNumber("buffId", this.BuffId);
+        // hbsInfo[0] is the variant-specific internal key; hbsInfo[2] is the pretty name.
+        // Captures both buffs (player-applied, teamId=0) and debuffs (enemy-applied, teamId=1);
+        // sourceTeamId on the event lets consumers distinguish.
+        w.WriteString("buffKey", this.BuffKey);
         w.WriteString("buffName", this.BuffName);
-        // Round-4.5: same probe as DebuffDamage. hbsInfo[0] is internal key; finding pretty name.
-        w.WriteString("probeHbsInfo1", this.HbsInfo1);
-        w.WriteString("probeHbsInfo2", this.HbsInfo2);
-        w.WriteString("probeHbsInfo3", this.HbsInfo3);
         w.WriteNumber("sourceId", this.SourceId);
         w.WriteNumber("targetId", this.TargetId);
         w.WriteBoolean("targetsEnemy", this.TargetsEnemy);
+        w.WriteNumber("sourceTeamId", this.SourceTeamId);
         w.WriteNumber("duration", this.Duration);
         w.WriteNumber("strength", this.Strength);
         w.WriteNumber("sourceHbId", this.SourceHbId);
@@ -250,6 +266,38 @@ public sealed record RemoveBuffEvent(int UniqueId, long GameTime) : BunnyLogEven
     public override string EventName => "RemoveBuff";
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteNumber("uniqueId", this.UniqueId);
+    }
+}
+
+/// <summary>
+/// `scr_trigger_call` dispatches buff create/destroy via triggerType 33 / 36 (handled as
+/// `AddBuff` / `RemoveBuff`). Types 34 and 35 also fire with buff-shaped context (statusId,
+/// hbsUniqueId, etc.) but their semantic meaning isn't characterized yet — possibly refresh /
+/// tick, possibly area-applied variants. This event surfaces them with the same payload as
+/// `AddBuff` plus the raw `triggerType` so we can identify a pattern across runs.
+/// </summary>
+public sealed record BuffSurveyEvent(
+    int TriggerType,
+    int UniqueId, int BuffId,
+    string BuffKey, string BuffName,
+    int SourceId, int TargetId, bool TargetsEnemy, int SourceTeamId,
+    int Duration, int Strength, int SourceHbId,
+    long GameTime
+) : BunnyLogEvent(GameTime) {
+    public override string EventName => "BuffSurvey";
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("triggerType", this.TriggerType);
+        w.WriteNumber("uniqueId", this.UniqueId);
+        w.WriteNumber("buffId", this.BuffId);
+        w.WriteString("buffKey", this.BuffKey);
+        w.WriteString("buffName", this.BuffName);
+        w.WriteNumber("sourceId", this.SourceId);
+        w.WriteNumber("targetId", this.TargetId);
+        w.WriteBoolean("targetsEnemy", this.TargetsEnemy);
+        w.WriteNumber("sourceTeamId", this.SourceTeamId);
+        w.WriteNumber("duration", this.Duration);
+        w.WriteNumber("strength", this.Strength);
+        w.WriteNumber("sourceHbId", this.SourceHbId);
     }
 }
 

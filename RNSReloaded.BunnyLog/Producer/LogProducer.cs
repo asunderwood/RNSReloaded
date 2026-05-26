@@ -22,6 +22,7 @@ internal unsafe class LogProducer : ILogProducer {
     private IHook<ScriptDelegate> addEnemyHook = null!;
     private IHook<ScriptDelegate> hallwayMoveHook = null!;
     private IHook<ScriptDelegate> chooseHallsHook = null!;
+    private IHook<ScriptDelegate> stageChangeHook = null!;
     private IHook<ScriptDelegate> triggerCallHook = null!;
     private IHook<ScriptDelegate> gameOverHook = null!;
     private IHook<ScriptDelegate> finishedFightHook = null!;
@@ -65,6 +66,7 @@ internal unsafe class LogProducer : ILogProducer {
         this.addEnemyHook = this.HookScript(hooks, "scrdt_enemy", this.AddEnemyDetour);
         this.hallwayMoveHook = this.HookScript(hooks, "scr_hallwayprogress_move_next", this.HallwayMoveDetour);
         this.chooseHallsHook = this.HookScript(hooks, "scr_hallwayprogress_choose_halls", this.ChooseHallsDetour);
+        this.stageChangeHook = this.HookScript(hooks, "scr_stage_change", this.StageChangeDetour);
         this.triggerCallHook = this.HookScript(hooks, "scr_trigger_call", this.TriggerCallDetour);
         this.gameOverHook = this.HookScript(hooks, "scr_gamecontrol_do_gameover", this.GameOverDetour);
         this.finishedFightHook = this.HookScript(hooks, "scr_battlecontroller_end_round", this.FinishedFightDetour);
@@ -132,21 +134,19 @@ internal unsafe class LogProducer : ILogProducer {
                 GameTime: gameTime
             ));
         } else {
-            // Debuff/status tick: self.dataId points into the STATUS table (hbsInfo), not itemData.
-            // Round 3 confirmed itemData lookups for debuff ticks produced "nothing_item" because
-            // those indices were the placeholder; the correct table is hbsInfo[statusId][0] (the
-            // same path TriggerCallDetour uses for AddBuff names). Note hbsInfo only exposes the
-            // display name — no separate key slot — so DebuffDamage ships only debuffName.
+            // Debuff / status tick. self.statusId indexes into hbsInfo (NOT itemData). Layout
+            // confirmed by the [1..3] probe: [0]=variant key, [1]=base key, [2]=pretty name,
+            // [3]=description. Ship [0] as debuffKey and [2] as debuffName.
             var debuffId = this.rns.utils.RValueToLong(this.rns.FindValue(self, "statusId"));
-            var (debuffName, p1, p2, p3) = this.LookupHbsInfo((int) debuffId);
+            var (debuffKey, debuffName) = this.LookupHbsInfo((int) debuffId);
             this.Emit(new DebuffDamageEvent(
                 PlayerId: (int) playerId,
                 PlayerName: playerName,
                 CharId: charId,
                 EnemyId: (int) enemyId,
                 DebuffId: (int) debuffId,
+                DebuffKey: debuffKey,
                 DebuffName: debuffName,
-                HbsInfo1: p1, HbsInfo2: p2, HbsInfo3: p3,
                 Damage: (int) damage,
                 PainShare: painShare,
                 GameTime: gameTime
@@ -181,22 +181,23 @@ internal unsafe class LogProducer : ILogProducer {
     }
 
     /// <summary>
-    /// Reads hbsInfo for a given statusId. Index [0] is confirmed to hold the internal key
-    /// (e.g. "hbs_poison_0"); indices [1..3] are round-4.5 probes for the pretty-name slot.
+    /// Reads hbsInfo for a given statusId. Layout confirmed by the [1..3] probe pass:
+    ///   [0] = variant-specific internal key (e.g. "hbs_poison_0"), returned as Key.
+    ///   [1] = base internal key (e.g. "hbs_poison"), not surfaced.
+    ///   [2] = pretty display name (e.g. "Poison"), returned as Name.
+    ///   [3] = description text, not surfaced.
+    /// Both reads are independently try/catch'd so a missing slot doesn't blank the other.
     /// </summary>
-    private (string Name, string Probe1, string Probe2, string Probe3) LookupHbsInfo(int statusId) {
-        string name = string.Empty;
-        string p1 = string.Empty, p2 = string.Empty, p3 = string.Empty;
+    private (string Key, string Name) LookupHbsInfo(int statusId) {
+        string key = string.Empty, name = string.Empty;
         try {
             var entry = this.rns
                 .FindValue(this.rns.GetGlobalInstance(), "hbsInfo")
                 ->Get(statusId);
-            try { name = entry->Get(0)->ToString() ?? string.Empty; } catch { }
-            try { p1   = entry->Get(1)->ToString() ?? string.Empty; } catch { }
-            try { p2   = entry->Get(2)->ToString() ?? string.Empty; } catch { }
-            try { p3   = entry->Get(3)->ToString() ?? string.Empty; } catch { }
+            try { key  = entry->Get(0)->ToString() ?? string.Empty; } catch { }
+            try { name = entry->Get(2)->ToString() ?? string.Empty; } catch { }
         } catch { }
-        return (name, p1, p2, p3);
+        return (key, name);
     }
 
     // itemData record layout confirmed by previous probe rounds:
@@ -277,6 +278,21 @@ internal unsafe class LogProducer : ILogProducer {
         var encounterKey = ReadArgvString(argc, argv, 0);
         this.Emit(new NewFightEvent(encounterKey, this.GameTime()));
         return this.newFightHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private RValue* StageChangeDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        // argv[0] = the new stage's location ID (int); argv[1] = transition animation ms.
+        // At run start argv[1] is "undefined" which RValueToLong throws on — caught, ms=0.
+        int locationId = 0;
+        int transitionMs = 0;
+        try { locationId = (int) this.rns.utils.RValueToLong(argv[0]); } catch { }
+        if (argc > 1) {
+            try { transitionMs = (int) this.rns.utils.RValueToLong(argv[1]); } catch { }
+        }
+        this.Emit(new StageChangeEvent(locationId, transitionMs, this.GameTime()));
+        return this.stageChangeHook.OriginalFunction(self, other, returnValue, argc, argv);
     }
 
     private RValue* AddEnemyDetour(
@@ -407,6 +423,8 @@ internal unsafe class LogProducer : ILogProducer {
     }
 
     private const long HBS_CREATED = 33;
+    private const long HBS_SURVEY_34 = 34;     // semantic TBD - same payload as create/destroy
+    private const long HBS_SURVEY_35 = 35;     // semantic TBD
     private const long HBS_DESTROYED = 36;
 
     private RValue* TriggerCallDetour(
@@ -415,40 +433,48 @@ internal unsafe class LogProducer : ILogProducer {
         var triggerType = argc > 0 ? this.rns.utils.RValueToLong(argv[0]) : 0;
 
         if (triggerType == HBS_CREATED) {
-            // teamId == 0 means a player-applied buff (we want it). teamId == 1 means an enemy
-            // applied something; for now we mirror DamageTracker and skip those.
-            var teamId = this.rns.utils.RValueToLong(this.rns.FindValue(self, "teamId"));
-            if (teamId == 0) {
-                var statusId = this.rns.utils.RValueToLong(this.rns.FindValue(self, "statusId"));
-                var (name, p1, p2, p3) = this.LookupHbsInfo((int) statusId);
-
-                this.Emit(new AddBuffEvent(
-                    UniqueId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "hbsUniqueId")),
-                    BuffId: (int) statusId,
-                    BuffName: name,
-                    HbsInfo1: p1, HbsInfo2: p2, HbsInfo3: p3,
-                    SourceId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "playerId")),
-                    TargetId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "aflPlayerId")),
-                    TargetsEnemy: this.rns.utils.RValueToLong(this.rns.FindValue(self, "aflTeamId")) == 1,
-                    Duration: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "initLength")),
-                    Strength: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "strength")),
-                    SourceHbId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "originHbId")),
-                    GameTime: this.GameTime()
-                ));
-            }
+            var ctx = this.GatherBuffContext(self);
+            this.Emit(new AddBuffEvent(
+                UniqueId: ctx.UniqueId,
+                BuffId: ctx.StatusId,
+                BuffKey: ctx.Key,
+                BuffName: ctx.Name,
+                SourceId: ctx.SourceId,
+                TargetId: ctx.TargetId,
+                TargetsEnemy: ctx.TargetsEnemy,
+                SourceTeamId: ctx.SourceTeamId,
+                Duration: ctx.Duration,
+                Strength: ctx.Strength,
+                SourceHbId: ctx.SourceHbId,
+                GameTime: this.GameTime()
+            ));
         } else if (triggerType == HBS_DESTROYED) {
-            var teamId = this.rns.utils.RValueToLong(this.rns.FindValue(self, "teamId"));
-            if (teamId == 0) {
-                this.Emit(new RemoveBuffEvent(
-                    UniqueId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "hbsUniqueId")),
-                    GameTime: this.GameTime()
-                ));
-            }
+            this.Emit(new RemoveBuffEvent(
+                UniqueId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "hbsUniqueId")),
+                GameTime: this.GameTime()
+            ));
+        } else if (triggerType == HBS_SURVEY_34 || triggerType == HBS_SURVEY_35) {
+            // 34/35 carry the same buff-shaped self context as 33/36; observe with the full payload
+            // so we can pattern-match meaning across runs (possibly refresh / tick / area-applied).
+            var ctx = this.GatherBuffContext(self);
+            this.Emit(new BuffSurveyEvent(
+                TriggerType: (int) triggerType,
+                UniqueId: ctx.UniqueId,
+                BuffId: ctx.StatusId,
+                BuffKey: ctx.Key,
+                BuffName: ctx.Name,
+                SourceId: ctx.SourceId,
+                TargetId: ctx.TargetId,
+                TargetsEnemy: ctx.TargetsEnemy,
+                SourceTeamId: ctx.SourceTeamId,
+                Duration: ctx.Duration,
+                Strength: ctx.Strength,
+                SourceHbId: ctx.SourceHbId,
+                GameTime: this.GameTime()
+            ));
         } else {
-            // scr_trigger_call is a dispatcher. Buffs use types 33/36; surface other triggerType
-            // values so we can characterize what else fires through here (possibly chest pickups,
-            // shop purchases, scripted events, etc.). Bounded sample per type to avoid flooding
-            // the log — this script fires constantly during gameplay.
+            // Other trigger types fire constantly during gameplay (movement, state-setters, etc.).
+            // Sample per-type so we still see the inventory without flooding the log.
             if (!this.triggerProbeSampleCount.TryGetValue(triggerType, out var count)) count = 0;
             if (count < MaxTriggerProbeSamplesPerType) {
                 this.triggerProbeSampleCount[triggerType] = count + 1;
@@ -467,6 +493,33 @@ internal unsafe class LogProducer : ILogProducer {
         }
 
         return this.triggerCallHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    /// <summary>
+    /// Common buff/status context shared by trigger types 33-36. We bundle the FindValue reads
+    /// in one place so the per-type dispatch in TriggerCallDetour stays readable. SourceTeamId
+    /// captures who applied the status (0 = player team, 1 = enemy team) so consumers can
+    /// distinguish buffs from debuffs without re-reading self.
+    /// </summary>
+    private (int UniqueId, int StatusId, string Key, string Name,
+             int SourceId, int TargetId, bool TargetsEnemy, int SourceTeamId,
+             int Duration, int Strength, int SourceHbId)
+        GatherBuffContext(CInstance* self) {
+        var statusId = (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "statusId"));
+        var (key, name) = this.LookupHbsInfo(statusId);
+        return (
+            UniqueId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "hbsUniqueId")),
+            StatusId: statusId,
+            Key: key,
+            Name: name,
+            SourceId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "playerId")),
+            TargetId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "aflPlayerId")),
+            TargetsEnemy: this.rns.utils.RValueToLong(this.rns.FindValue(self, "aflTeamId")) == 1,
+            SourceTeamId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "teamId")),
+            Duration: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "initLength")),
+            Strength: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "strength")),
+            SourceHbId: (int) this.rns.utils.RValueToLong(this.rns.FindValue(self, "originHbId"))
+        );
     }
 
     // === Survey hooks ============================================================================
@@ -561,7 +614,7 @@ internal unsafe class LogProducer : ILogProducer {
         //   - scr_hbsflag_check: called constantly while ANY buff exists (per-frame per-buff).
         //   - scr_player_update_control: per-frame per-player input poll.
         // Both are dropped — too noisy to instrument as catch-alls without per-condition gating.
-        "scr_stage_change",
+        // scr_stage_change is now a first-class hook (typed StageChangeEvent), removed from here.
         "scr_stage_play_music",
         "scr_hallwayprogress_start_hallway",
         "scr_init_adventure_map",
