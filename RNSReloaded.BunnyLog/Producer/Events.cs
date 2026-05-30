@@ -127,7 +127,9 @@ public sealed record StageChangeEvent(int LocationId, int TransitionMs, long Gam
 /// 0/16/32/64 distribution still isn't characterized.
 /// </summary>
 public sealed record HallwayMoveStageProbe(
-    string Notch_3,
+    // Deeper notch indices — chests' offered items may be rolled and stored here at notch-create
+    // time. We confirmed [0]=type, [1]=encounterKey, [2]=seed; [3..7] are open candidates.
+    string Notch_3, string Notch_4, string Notch_5, string Notch_6, string Notch_7,
     string SelfCurrentStage, string SelfCurrentHall, string SelfCurrentLocation,
     string SelfStage, string SelfHall, string SelfLocation, string SelfZone,
     string SelfStageHall, string SelfStageLoc, string SelfStageNum,
@@ -150,6 +152,10 @@ public sealed record HallwayMoveEvent(
         w.WriteString("notchSeed", this.NotchSeed);
         var p = this.StageProbe;
         w.WriteString("probeNotch_3", p.Notch_3);
+        w.WriteString("probeNotch_4", p.Notch_4);
+        w.WriteString("probeNotch_5", p.Notch_5);
+        w.WriteString("probeNotch_6", p.Notch_6);
+        w.WriteString("probeNotch_7", p.Notch_7);
         w.WriteString("probeSelfCurrentStage", p.SelfCurrentStage);
         w.WriteString("probeSelfCurrentHall", p.SelfCurrentHall);
         w.WriteString("probeSelfCurrentLocation", p.SelfCurrentLocation);
@@ -266,6 +272,113 @@ public sealed record RemoveBuffEvent(int UniqueId, long GameTime) : BunnyLogEven
     public override string EventName => "RemoveBuff";
     public override void WriteDataFields(Utf8JsonWriter w) {
         w.WriteNumber("uniqueId", this.UniqueId);
+    }
+}
+
+/// <summary>
+/// Self-describing scan of an instance / the global table for the item structure we keep failing
+/// to name. The mod tries a wide candidate field-name list against `self`, `other`, and globals;
+/// every field that reads as a non-empty array or scalar becomes one descriptive string —
+/// `"storebin=[it_a, it_b, ...]"` or `"itemCount=5"`. Empty fields are omitted. Adding a new
+/// candidate name is a one-line change on the mod side; nothing here is fixed-schema, so the
+/// relay just relays the strings and the log shows the winner directly.
+/// </summary>
+public static class ItemScanWriter {
+    public static void WriteStringArrayField(Utf8JsonWriter w, string name, IReadOnlyList<string> arr) {
+        w.WriteStartArray(name);
+        for (var i = 0; i < arr.Count; i++) {
+            w.WriteStringValue(arr[i]);
+        }
+        w.WriteEndArray();
+    }
+}
+
+/// <summary>
+/// Fired from `scr_itemsys_pickup`. Args characterized from a focused chest+shop run:
+///   argv[0] = playerId; argv[1] = source (1 = chest, 2 = shop); argv[2] = slot index picked.
+/// The slot tells us which choice, not what was at it. SelfHits / OtherHits / GlobHits are the
+/// field-scan results (see <see cref="ItemScanWriter"/>) — the hunt for the offered-items list.
+/// </summary>
+public sealed record ItemPickupEvent(
+    int PlayerId, int Source, int Slot,
+    IReadOnlyList<string> SelfHits, IReadOnlyList<string> OtherHits, IReadOnlyList<string> GlobHits,
+    long GameTime
+) : BunnyLogEvent(GameTime) {
+    public override string EventName => "ItemPickup";
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("playerId", this.PlayerId);
+        w.WriteNumber("source", this.Source);
+        w.WriteNumber("slot", this.Slot);
+        ItemScanWriter.WriteStringArrayField(w, "selfHits", this.SelfHits);
+        ItemScanWriter.WriteStringArrayField(w, "otherHits", this.OtherHits);
+        ItemScanWriter.WriteStringArrayField(w, "globHits", this.GlobHits);
+    }
+}
+
+/// <summary>
+/// Fired from `scr_itemsys_create_item(dataId, playerId, category)` — the item factory. Confirmed
+/// layout: argv0 = dataId (indexes the global `itemData` table), argv1 = playerId, argv2 = a
+/// category enum, and the return value is a run-global sequential item instance id. Every offered
+/// item (chest loot, shop stock, player loadout) is born here, so this is the complete capture of
+/// "what items appeared." Key + pretty name are resolved mod-side from `itemData[dataId][0][0/2]`
+/// (the same table ability names come from).
+///
+/// Category enum (observed, not yet exhaustive): 7 = player ability/loadout, 1 = loot (chest),
+/// 2 = store (shop), 15 = item re-created on purchase (owned). Shipped raw; the relay labels it.
+///
+/// Slot binding: within one area's creation batch, the pickup's `slot` indexes items in creation
+/// order (slot 0 = first created). That correlation lives on the relay side.
+/// </summary>
+public sealed record ItemCreateEvent(
+    int DataId, int PlayerId, int Category, int InstanceId,
+    string Key, string Name, long GameTime
+) : BunnyLogEvent(GameTime) {
+    public override string EventName => "ItemCreate";
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteNumber("dataId", this.DataId);
+        w.WriteNumber("playerId", this.PlayerId);
+        w.WriteNumber("category", this.Category);
+        w.WriteNumber("instanceId", this.InstanceId);
+        w.WriteString("key", this.Key);
+        w.WriteString("name", this.Name);
+    }
+}
+
+/// <summary>
+/// Fired from the chest/shop SETUP scripts (names from the user's full script dump):
+/// `scr_itemsys_populate_loot/_store` (seed-driven generators — expose nothing via self/ret),
+/// `refresh_storebin`, `open_store`, `setpos_store`, and the `scrc_h_*` / `scr_lobbyhost_buff_*`
+/// populate variants. The `_single` variants likely populate one slot per call, so the item
+/// identity is most likely an ARGUMENT — hence argv0..6 (scalar) plus ArgHits (each arg scanned
+/// as an array, in case a `_single` call is handed the whole item record). `Source`: 1=loot, 2=store.
+/// </summary>
+public sealed record ItemPopulateEvent(
+    string ScriptName, int Source,
+    int Argc, string Argv0, string Argv1, string Argv2, string Argv3,
+    string Argv4, string Argv5, string Argv6,
+    IReadOnlyList<string> ArgHits,
+    string RetScalar, IReadOnlyList<string> RetArray,
+    IReadOnlyList<string> SelfHits, IReadOnlyList<string> OtherHits, IReadOnlyList<string> GlobHits,
+    long GameTime
+) : BunnyLogEvent(GameTime) {
+    public override string EventName => "ItemPopulate";
+    public override void WriteDataFields(Utf8JsonWriter w) {
+        w.WriteString("scriptName", this.ScriptName);
+        w.WriteNumber("source", this.Source);
+        w.WriteNumber("argc", this.Argc);
+        w.WriteString("argv0", this.Argv0);
+        w.WriteString("argv1", this.Argv1);
+        w.WriteString("argv2", this.Argv2);
+        w.WriteString("argv3", this.Argv3);
+        w.WriteString("argv4", this.Argv4);
+        w.WriteString("argv5", this.Argv5);
+        w.WriteString("argv6", this.Argv6);
+        ItemScanWriter.WriteStringArrayField(w, "argHits", this.ArgHits);
+        w.WriteString("retScalar", this.RetScalar);
+        ItemScanWriter.WriteStringArrayField(w, "retArray", this.RetArray);
+        ItemScanWriter.WriteStringArrayField(w, "selfHits", this.SelfHits);
+        ItemScanWriter.WriteStringArrayField(w, "otherHits", this.OtherHits);
+        ItemScanWriter.WriteStringArrayField(w, "globHits", this.GlobHits);
     }
 }
 

@@ -26,6 +26,8 @@ internal unsafe class LogProducer : ILogProducer {
     private IHook<ScriptDelegate> triggerCallHook = null!;
     private IHook<ScriptDelegate> gameOverHook = null!;
     private IHook<ScriptDelegate> finishedFightHook = null!;
+    private IHook<ScriptDelegate> itemPickupHook = null!;
+    private IHook<ScriptDelegate> itemCreateHook = null!;
     // Debug-branch survey hooks. Their events ship raw argv + a few self field reads without
     // interpretation — meaning gets applied later by reviewing the log-mirror file.
     private IHook<ScriptDelegate> playerInvulnHook = null!;
@@ -38,6 +40,31 @@ internal unsafe class LogProducer : ILogProducer {
     // Strong refs to the per-script detour delegates so they aren't GC'd. C# closures referenced
     // only by native code can otherwise be collected.
     private readonly List<ScriptDelegate> probeDelegates = new();
+    // Item populate / store-setup hooks — names from the user's full script dump. Each fires a
+    // typed ItemPopulateEvent post-call. Tolerant: a missing name is simply not added. Kept in a
+    // list so references stay alive for the mod's lifetime.
+    private readonly List<IHook<ScriptDelegate>> populateHooks = new();
+
+    // (name, source) candidates for the item populate / store-setup hooks. source follows the
+    // pickup convention: 1 = loot/chest, 2 = store/shop. The plain populate_store/_loot are
+    // seed-driven generators that delegate the actual item-writing — the _network_* variants and
+    // refresh_storebin are the suspected real writers. "storebin" is the structure name lead.
+    private static readonly (string Name, int Source)[] PopulateCandidates = {
+        // Seed-only generators (kept for timing / seed correlation; expose nothing via self/ret).
+        ("scr_itemsys_populate_loot", 1),
+        ("scr_itemsys_populate_store", 2),
+        ("scr_itemsys_refresh_storebin", 2),
+        ("scr_itemsys_populate_loot_end", 1),   // fires after loot fill — table may be reachable
+        // ITEM FACTORY — scr_itemsys_create_item is now a first-class typed ItemCreate hook
+        // (argv0=dataId, argv1=playerId, argv2=category, ret=instanceId). Kept here for cross-check
+        // and slot-binding discovery:
+        ("scr_itemsys_create_item_by_key", 0),  // confirms dataId<->key (argv0 is the literal key)
+        ("scr_itemsys_place_item_in_row", 0),   // argv0=instanceId, argv1=row/section — slot binding
+        // Loot-specific pickup ("helditem" = the held item), distinct from scr_itemsys_pickup.
+        ("scr_itemsys_helditem_pickup_loot", 1),
+        // NOTE: scrc_h_* / scr_lobbyhost_* populate scripts exist but are host/networking paths —
+        // confirmed to NOT fire in single-player (they hooked cleanly, never executed). Dropped.
+    };
 
     // Single-string-array allocation reused for empty 5-tuple defaults to avoid allocations in
     // the ChooseHalls detour. ChooseHalls only fires once per run so this is a micro-optimization
@@ -57,6 +84,13 @@ internal unsafe class LogProducer : ILogProducer {
     private const int MaxScriptProbeSamplesPerName = 200;
     private readonly Dictionary<string, int> scriptProbeSampleCount = new();
 
+    // Per-script cap on ItemPopulate emissions. The factory scripts (create_item*) fire in bursts
+    // (per item created) rather than per-frame, so the flood risk is bounded, but a generous cap
+    // still guards against an unexpected draw-loop caller. 120 comfortably covers a focused run's
+    // run-start loadout plus a chest (5) and shop (6) without truncating the items we care about.
+    private const int MaxItemPopulateSamplesPerScript = 120;
+    private readonly Dictionary<string, int> itemPopulateSampleCount = new();
+
     public LogProducer(IRNSReloaded rns, IReloadedHooks hooks, ILoggerV1 logger) {
         this.rns = rns;
         this.logger = logger;
@@ -73,6 +107,23 @@ internal unsafe class LogProducer : ILogProducer {
         this.playerInvulnHook = this.HookScript(hooks, "scr_player_invuln", this.PlayerInvulnDetour);
         this.playerHitHook = this.HookScript(hooks, "scr_pattern_deal_damage_ally", this.PlayerHitDetour);
         this.rewardHook = this.HookScript(hooks, "scr_rankbar_give_rewards", this.RewardDetour);
+        this.itemPickupHook = this.HookScript(hooks, "scr_itemsys_pickup", this.ItemPickupDetour);
+        this.itemCreateHook = this.HookScript(hooks, "scr_itemsys_create_item", this.ItemCreateDetour);
+
+        // Chest/shop SETUP hooks (user-supplied names). Tolerant — log which ones exist.
+        var hookedPopulate = new List<string>();
+        foreach (var (name, src) in PopulateCandidates) {
+            var hook = this.TryHookItemPopulate(hooks, name, src);
+            if (hook is not null) {
+                this.populateHooks.Add(hook);
+                hookedPopulate.Add(name);
+            }
+        }
+        this.logger.PrintMessage(
+            $"BunnyLog: hooked {hookedPopulate.Count} of {PopulateCandidates.Length} populate/store-setup scripts" +
+            (hookedPopulate.Count > 0 ? ": " + string.Join(", ", hookedPopulate) : ""),
+            this.logger.ColorYellow
+        );
 
         this.AttachProbeHooks(hooks);
     }
@@ -338,11 +389,16 @@ internal unsafe class LogProducer : ILogProducer {
     }
 
     private HallwayMoveStageProbe ProbeHallwayMoveStage(CInstance* self, int currentPos) {
-        string notch3 = string.Empty;
+        string notch3 = string.Empty, notch4 = string.Empty, notch5 = string.Empty;
+        string notch6 = string.Empty, notch7 = string.Empty;
         try { notch3 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(3)->ToString() ?? ""; } catch { }
+        try { notch4 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(4)->ToString() ?? ""; } catch { }
+        try { notch5 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(5)->ToString() ?? ""; } catch { }
+        try { notch6 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(6)->ToString() ?? ""; } catch { }
+        try { notch7 = this.rns.FindValue(self, "notches")->Get(currentPos)->Get(7)->ToString() ?? ""; } catch { }
 
         return new HallwayMoveStageProbe(
-            Notch_3: notch3,
+            Notch_3: notch3, Notch_4: notch4, Notch_5: notch5, Notch_6: notch6, Notch_7: notch7,
             SelfCurrentStage:    ReadSelfString(this.rns, self, "currentStage"),
             SelfCurrentHall:     ReadSelfString(this.rns, self, "currentHall"),
             SelfCurrentLocation: ReadSelfString(this.rns, self, "currentLocation"),
@@ -592,6 +648,223 @@ internal unsafe class LogProducer : ILogProducer {
         return this.rewardHook.OriginalFunction(self, other, returnValue, argc, argv);
     }
 
+    // Width of each candidate offered-items array probe. Chests contain 5 items per the user's
+    // observation; shop has at least 6 (slot 5 was used). 8 covers both with headroom.
+    private const int ItemPickupProbeArrayLen = 8;
+
+    private RValue* ItemPickupDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        // Args characterized empirically: argv[0]=playerId, argv[1]=source (1=chest, 2=shop),
+        // argv[2]=slot index of the chosen entry within the offered-items list.
+        var playerId = 0;
+        var source = 0;
+        var slot = 0;
+        try { playerId = (int) this.rns.utils.RValueToLong(argv[0]); } catch { }
+        try { source   = (int) this.rns.utils.RValueToLong(argv[1]); } catch { }
+        try { slot     = (int) this.rns.utils.RValueToLong(argv[2]); } catch { }
+
+        var (selfHits, otherHits, globHits) = this.ScanItemFields(self, other);
+        this.Emit(new ItemPickupEvent(playerId, source, slot, selfHits, otherHits, globHits, this.GameTime()));
+        return this.itemPickupHook.OriginalFunction(self, other, returnValue, argc, argv);
+    }
+
+    private RValue* ItemCreateDetour(
+        CInstance* self, CInstance* other, RValue* returnValue, int argc, RValue** argv
+    ) {
+        // Call original first so returnValue holds the new item's instance id.
+        var result = this.itemCreateHook.OriginalFunction(self, other, returnValue, argc, argv);
+
+        var dataId = 0;
+        var playerId = 0;
+        var category = 0;
+        try { dataId   = (int) this.rns.utils.RValueToLong(argv[0]); } catch { }
+        try { playerId = (int) this.rns.utils.RValueToLong(argv[1]); } catch { }
+        try { category = (int) this.rns.utils.RValueToLong(argv[2]); } catch { }
+        var instanceId = 0;
+        try { instanceId = (int) this.rns.utils.RValueToLong(returnValue); } catch { }
+
+        var (key, name) = this.LookupItemByDataId(dataId);
+        this.Emit(new ItemCreateEvent(dataId, playerId, category, instanceId, key, name, this.GameTime()));
+        return result;
+    }
+
+    // Resolves a dataId to its (key, pretty name) via the global itemData table — same access
+    // path as LookupAbility, but keyed by an explicit dataId rather than self.dataId. Each slot
+    // read is independently guarded so a missing pretty name doesn't blank the key.
+    private (string Key, string Name) LookupItemByDataId(int dataId) {
+        string key = string.Empty, name = string.Empty;
+        if (dataId <= 0) return (key, name);
+        try {
+            var sub0 = this.rns
+                .FindValue(this.rns.GetGlobalInstance(), "itemData")
+                ->Get(dataId)->Get(0);
+            try { key  = sub0->Get(0)->ToString() ?? string.Empty; } catch { }
+            try { name = sub0->Get(2)->ToString() ?? string.Empty; } catch { }
+        } catch { }
+        return (key, name);
+    }
+
+    // Candidate field names scanned on instances (self / other) when hunting for the offered /
+    // owned item structure. "storebin" / "lootbin" are the strongest leads (from the script-dump
+    // name scr_itemsys_refresh_storebin); the rest are accumulated guesses. Append freely — each
+    // miss is a cheap failed FindValue.
+    private static readonly string[] ItemInstanceFields = {
+        "items", "options", "choices", "loot", "inventory", "itemList", "contents", "offered",
+        "dataIds", "itemPool", "pool", "lootTable",
+        "storebin", "lootbin", "potionbin", "upgradebin", "store", "bin",
+        "potions", "upgrades", "storeItems", "lootItems", "itemCount", "choiceCount", "size",
+    };
+
+    // Candidate global names scanned in parallel (the structure may be a global, not on the
+    // instance). Includes the same storebin family.
+    private static readonly string[] ItemGlobalFields = {
+        "chestItems", "shopItems", "currentLoot", "currentShop", "lootOptions", "shopInventory",
+        "currentItems", "lootDataIds", "shopDataIds",
+        "storebin", "lootbin", "potionbin", "upgradebin", "store", "loot",
+        "storeItems", "currentStore", "currentChest", "potions", "upgrades",
+    };
+
+    // Probes self / other / globals for the item structure. Returns three lists of self-describing
+    // hit strings ("field=[v0, v1, ...]" for arrays, "field=value" for scalars). Empty/missing
+    // fields are omitted, so a populated structure stands out immediately in the log.
+    private (List<string> Self, List<string> Other, List<string> Glob) ScanItemFields(CInstance* self, CInstance* other) {
+        return (
+            this.ScanInstanceFields(self, ItemInstanceFields),
+            this.ScanInstanceFields(other, ItemInstanceFields),
+            this.ScanInstanceFields(this.rns.GetGlobalInstance(), ItemGlobalFields)
+        );
+    }
+
+    // Tolerant hook for the chest/shop populate scripts. The detour calls the original FIRST so
+    // the populate function fills its structures, THEN probes for the now-populated offered list.
+    private IHook<ScriptDelegate>? TryHookItemPopulate(IReloadedHooks hooks, string name, int source) {
+        var id = this.rns.ScriptFindId(name);
+        if (id == -1) return null;
+        try {
+            var script = this.rns.GetScriptData(id - 100000);
+            IHook<ScriptDelegate>? hookRef = null;
+            ScriptDelegate detour = (self, other, ret, argc, argv) => {
+                var result = hookRef!.OriginalFunction(self, other, ret, argc, argv);
+                this.ItemPopulateEmit(name, source, self, other, ret, argc, argv);
+                return result;
+            };
+            hookRef = hooks.CreateHook<ScriptDelegate>(detour, script->Functions->Function);
+            hookRef.Activate();
+            hookRef.Enable();
+            this.probeDelegates.Add(detour);
+            return hookRef;
+        } catch {
+            return null;
+        }
+    }
+
+    private void ItemPopulateEmit(
+        string scriptName, int source, CInstance* self, CInstance* other, RValue* ret, int argc, RValue** argv
+    ) {
+        // Cap per script so a per-frame setpos/refresh can't flood the log (and we skip the
+        // expensive field scan once capped).
+        if (!this.itemPopulateSampleCount.TryGetValue(scriptName, out var count)) count = 0;
+        if (count >= MaxItemPopulateSamplesPerScript) return;
+        this.itemPopulateSampleCount[scriptName] = count + 1;
+
+        // The return value may itself hold the populated list (array form) or a single item
+        // identity (scalar form) — capture both.
+        var retArray = new string[ItemPickupProbeArrayLen];
+        Array.Fill(retArray, string.Empty);
+        var retScalar = string.Empty;
+        if (ret != null) {
+            for (var i = 0; i < ItemPickupProbeArrayLen; i++) {
+                try {
+                    var v = ret->Get(i);
+                    if (v != null) retArray[i] = v->ToString() ?? string.Empty;
+                } catch { }
+            }
+            try { retScalar = ret->ToString() ?? string.Empty; } catch { }
+        }
+
+        // Scan each argument as an array — a _single(itemRecord) call might hand us the whole
+        // item struct as one arg, whose elements (key, name, ...) we'd only see via Get(i).
+        var argHits = new List<string>();
+        for (var a = 0; a < argc && a < 8; a++) {
+            var vals = new List<string>();
+            var any = false;
+            for (var i = 0; i < ItemPickupProbeArrayLen; i++) {
+                var s = string.Empty;
+                try {
+                    var v = argv[a]->Get(i);
+                    if (v != null) s = v->ToString() ?? string.Empty;
+                } catch { }
+                if (s.Length > 0) any = true;
+                vals.Add(s);
+            }
+            if (any) argHits.Add($"argv{a}=[{string.Join(", ", vals)}]");
+        }
+
+        var (selfHits, otherHits, globHits) = this.ScanItemFields(self, other);
+        this.Emit(new ItemPopulateEvent(
+            ScriptName: scriptName,
+            Source: source,
+            Argc: argc,
+            // Widened argv: a _single(slot, dataId)-style call may pass the placed item's identity
+            // directly, so capture the full scalar span (plus ArgHits for array-shaped args).
+            Argv0: ReadArgvString(argc, argv, 0),
+            Argv1: ReadArgvString(argc, argv, 1),
+            Argv2: ReadArgvString(argc, argv, 2),
+            Argv3: ReadArgvString(argc, argv, 3),
+            Argv4: ReadArgvString(argc, argv, 4),
+            Argv5: ReadArgvString(argc, argv, 5),
+            Argv6: ReadArgvString(argc, argv, 6),
+            ArgHits: argHits,
+            RetScalar: retScalar,
+            RetArray: retArray,
+            SelfHits: selfHits,
+            OtherHits: otherHits,
+            GlobHits: globHits,
+            GameTime: this.GameTime()
+        ));
+    }
+
+    // Scans an instance's candidate fields and returns self-describing hit strings. A field that
+    // reads as a non-empty array yields "field=[v0, v1, ...]"; otherwise a non-trivial scalar
+    // yields "field=value". Missing / empty / zero fields are omitted. One pass over a wide
+    // candidate list — the whole point is to let us throw names at the wall cheaply and read the
+    // winner straight out of the log.
+    private List<string> ScanInstanceFields(CInstance* inst, string[] candidates) {
+        var hits = new List<string>();
+        if (inst == null) return hits;
+        foreach (var field in candidates) {
+            RValue* fv;
+            try { fv = this.rns.FindValue(inst, field); } catch { continue; }
+            if (fv == null) continue;
+
+            // Array form first.
+            var vals = new List<string>();
+            var anyArray = false;
+            for (var i = 0; i < ItemPickupProbeArrayLen; i++) {
+                var s = string.Empty;
+                try {
+                    var v = fv->Get(i);
+                    if (v != null) s = v->ToString() ?? string.Empty;
+                } catch { }
+                if (s.Length > 0) anyArray = true;
+                vals.Add(s);
+            }
+            if (anyArray) {
+                hits.Add($"{field}=[{string.Join(", ", vals)}]");
+                continue;
+            }
+
+            // Scalar fallback. Filter trivial values so the hit list stays signal-only.
+            string scalar = string.Empty;
+            try { scalar = fv->ToString() ?? string.Empty; } catch { }
+            if (scalar.Length > 0 && scalar != "0" && scalar != "0.00" && scalar != "[array]") {
+                hits.Add($"{field}={scalar}");
+            }
+        }
+        return hits;
+    }
+
     // === Layer C: tolerant try-hooks ==============================================================
     // Each candidate is attempted once at startup; missing scripts (ScriptFindId == -1) are
     // silently skipped. Survivors all emit ScriptProbeEvent with the script name as the
@@ -631,10 +904,18 @@ internal unsafe class LogProducer : ILogProducer {
         "scr_hallwayprogress_finish",
         // Stage-level guesses (scr_stage_change + scr_stage_play_music are confirmed).
         "scr_stage_init", "scr_stage_start", "scr_stage_finish", "scr_stage_end", "scr_stage_complete",
-        // itemsys-* guesses (scr_itemsys_erase_potions confirms the namespace).
-        "scr_itemsys_add", "scr_itemsys_give", "scr_itemsys_grant", "scr_itemsys_remove",
-        "scr_itemsys_clear", "scr_itemsys_init", "scr_itemsys_pickup", "scr_itemsys_buy",
-        "scr_itemsys_get", "scr_itemsys_has_item", "scr_itemsys_get_count",
+        // itemsys-* guesses (scr_itemsys_erase_potions + scr_itemsys_pickup confirm the namespace).
+        // scr_itemsys_pickup is now a first-class hook (typed ItemPickupEvent).
+        // First pass (none of these hit): add, give, grant, remove, clear, init, buy, get,
+        // has_item, get_count — keeping a few in case the game version changes.
+        "scr_itemsys_add", "scr_itemsys_buy",
+        // New verbs targeting "the offered items get set up here" hypothesis. If any of these
+        // fire before scr_itemsys_pickup, the offered list is probably accessible from inside.
+        "scr_itemsys_offer", "scr_itemsys_present", "scr_itemsys_show",
+        "scr_itemsys_choose", "scr_itemsys_setup", "scr_itemsys_apply",
+        "scr_itemsys_select", "scr_itemsys_roll", "scr_itemsys_generate",
+        "scr_itemsys_populate", "scr_itemsys_open", "scr_itemsys_close",
+        "scr_itemsys_create_loot", "scr_itemsys_create_shop", "scr_itemsys_roll_loot",
         // dt-namespace (scrdt_encounter, scrdt_enemy are confirmed).
         "scrdt_item", "scrdt_loot", "scrdt_chest", "scrdt_shop", "scrdt_treasure",
         "scrdt_reward", "scrdt_hall", "scrdt_stage",
